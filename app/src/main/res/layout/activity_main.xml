@@ -40,8 +40,9 @@
         <com.google.android.material.textfield.TextInputEditText
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="textNoSuggestions|textShortMessage"
+            android:inputType="textFilter"
             android:hint="@string/command_hint"
+            android:enabled="false"
             android:id="@+id/command" />
     </com.google.android.material.textfield.TextInputLayout>
 </RelativeLayout>

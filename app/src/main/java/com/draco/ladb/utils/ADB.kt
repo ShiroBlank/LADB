@@ -1,9 +1,15 @@
 package com.draco.ladb.utils
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.Settings
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.preference.PreferenceManager
+import com.draco.ladb.BuildConfig
 import com.draco.ladb.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -12,12 +18,15 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
 import java.io.PrintStream
+import java.lang.NumberFormatException
+import java.util.concurrent.TimeUnit
 
 class ADB(private val context: Context) {
     companion object {
         const val MAX_OUTPUT_BUFFER_SIZE = 1024 * 16
         const val OUTPUT_BUFFER_DELAY_MS = 100L
 
+        @SuppressLint("StaticFieldLeak")
         @Volatile private var instance: ADB? = null
         fun getInstance(context: Context): ADB = instance ?: synchronized(this) {
             instance ?: ADB(context).also { instance = it }
@@ -54,6 +63,18 @@ class ADB(private val context: Context) {
     private var shellProcess: Process? = null
 
     /**
+     * Returns the user buffer size if valid, else the default
+     */
+    fun getOutputBufferSize(): Int {
+        val userValue = sharedPrefs.getString(context.getString(R.string.buffer_size_key), "16384")!!
+        return try {
+            Integer.parseInt(userValue)
+        } catch (_: NumberFormatException) {
+            MAX_OUTPUT_BUFFER_SIZE
+        }
+    }
+
+    /**
      * Decide how to initialize the shellProcess variable
      */
     fun initializeClient() {
@@ -61,47 +82,74 @@ class ADB(private val context: Context) {
             return
 
         val autoShell = sharedPrefs.getBoolean(context.getString(R.string.auto_shell_key), true)
-        if (autoShell)
-            initializeADBShell()
-        else
-            initializeShell()
+        val autoPair = sharedPrefs.getBoolean(context.getString(R.string.auto_pair_key), true)
+        val autoWireless = sharedPrefs.getBoolean(context.getString(R.string.auto_wireless_key), true)
+        val startupCommand = sharedPrefs.getString(context.getString(R.string.startup_command_key), "echo 'Success! ※\\(^o^)/※'")!!
+
+        initializeADBShell(autoShell, autoPair, autoWireless, startupCommand)
     }
 
     /**
      * Scan and make a connection to a wireless device
      */
-    private fun initializeADBShell() {
-        debug("Starting ADB client")
-        adb(false, listOf("start-server"))?.waitFor()
-        debug("Waiting for device to be found")
-        adb(false, listOf("wait-for-device"))?.waitFor()
+    private fun initializeADBShell(autoShell: Boolean, autoPair: Boolean, autoWireless: Boolean, startupCommand: String) {
+        val secureSettingsGranted =
+            context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED
+
+        if (autoWireless) {
+            debug("Enabling wireless debugging")
+            if (secureSettingsGranted) {
+                Settings.Global.putInt(
+                    context.contentResolver,
+                    "adb_wifi_enabled",
+                    1
+                )
+                debug("Waiting a few moments...")
+                Thread.sleep(3_000)
+            } else {
+                debug("NOTE: Secure settings permission not granted yet")
+                debug("NOTE: After first pair, it will auto-grant")
+            }
+        }
+
+        if (autoPair) {
+            debug("Starting ADB client")
+            adb(false, listOf("start-server"))?.waitFor()
+            debug("Waiting for device respond (max 5m)")
+            adb(false, listOf("wait-for-device"))?.waitFor()
+        }
 
         debug("Shelling into device")
-        val process = adb(true, listOf("-t", "1", "shell"))
+        val process = if (autoShell && autoPair) {
+            val argList = if (Build.SUPPORTED_ABIS[0] == "arm64-v8a")
+                listOf("-t", "1", "shell")
+            else
+                listOf("shell")
+            adb(true, argList)
+        } else
+            shell(true, listOf("sh", "-l"))
+
         if (process == null) {
             debug("Failed to open shell connection")
             return
         }
         shellProcess = process
-        sendToShellProcess("echo 'Success! ※\\(^o^)/※'")
-        _ready.postValue(true)
 
-        startShellDeathThread()
-    }
-
-    /**
-     * Make a local shell instance
-     */
-    private fun initializeShell() {
-        debug("Shelling into device")
-        val process = shell(true, listOf("sh", "-l"))
-        if (process == null) {
-            debug("Failed to open shell connection")
-            return
-        }
-        shellProcess = process
         sendToShellProcess("alias adb=\"$adbPath\"")
-        sendToShellProcess("echo 'Success! ※\\(^o^)/※'")
+
+        if (autoWireless && !secureSettingsGranted) {
+            sendToShellProcess("echo 'NOTE: Granting secure settings permission for next time'")
+            sendToShellProcess("pm grant ${BuildConfig.APPLICATION_ID} android.permission.WRITE_SECURE_SETTINGS")
+        }
+
+        if (autoShell && autoPair)
+            sendToShellProcess("echo 'NOTE: Dropped into ADB shell automatically'")
+        else
+            sendToShellProcess("echo 'NOTE: In unprivileged shell, not ADB shell'")
+
+        if (startupCommand.isNotEmpty())
+            sendToShellProcess(startupCommand)
+
         _ready.postValue(true)
 
         startShellDeathThread()
@@ -134,10 +182,6 @@ class ADB(private val context: Context) {
         debug("Killing ADB server")
         adb(false, listOf("kill-server"))?.waitFor()
         debug("Erasing all ADB server files")
-        with (sharedPrefs.edit()) {
-            putBoolean(context.getString(R.string.paired_key), false)
-            apply()
-        }
         context.filesDir.deleteRecursively()
         context.cacheDir.deleteRecursively()
         _closed.postValue(true)
@@ -150,7 +194,7 @@ class ADB(private val context: Context) {
         val pairShell = adb(true, listOf("pair", "localhost:$port"))
 
         /* Sleep to allow shell to catch up */
-        Thread.sleep(1000)
+        Thread.sleep(5000)
 
         /* Pipe pairing code */
         PrintStream(pairShell?.outputStream).apply {
@@ -158,8 +202,8 @@ class ADB(private val context: Context) {
             flush()
         }
 
-        /* Continue once finished pairing */
-        pairShell?.waitFor()
+        /* Continue once finished pairing (or 10s elapses) */
+        pairShell?.waitFor(10, TimeUnit.SECONDS)
     }
 
     /**

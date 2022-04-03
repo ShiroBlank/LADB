@@ -5,9 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.lifecycle.lifecycleScope
-import androidx.preference.Preference
-import androidx.preference.PreferenceFragmentCompat
-import androidx.preference.SwitchPreference
+import androidx.preference.*
 import com.draco.ladb.R
 import com.draco.ladb.utils.ADB
 import com.google.android.gms.oss.licenses.OssLicensesMenuActivity
@@ -31,10 +29,18 @@ class HelpPreferenceFragment : PreferenceFragmentCompat() {
     override fun onPreferenceTreeClick(preference: Preference): Boolean {
         when (preference.key) {
             getString(R.string.reset_key) -> {
-                lifecycleScope.launch(Dispatchers.IO) {
-                    adb.reset()
+                context?.let {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        /* Unpair server and client */
+                        with(PreferenceManager.getDefaultSharedPreferences(it).edit()) {
+                            putBoolean(getString(R.string.paired_key), false)
+                            commit()
+                        }
+
+                        adb.reset()
+                    }
+                    activity?.finish()
                 }
-                activity?.finish()
             }
 
             getString(R.string.developer_key) -> openURL(getString(R.string.developer_url))
@@ -46,7 +52,7 @@ class HelpPreferenceFragment : PreferenceFragmentCompat() {
             }
 
             else -> {
-                if (preference !is SwitchPreference) {
+                if (preference !is SwitchPreference && preference !is EditTextPreference) {
                     MaterialAlertDialogBuilder(requireContext())
                         .setTitle(preference.title)
                         .setMessage(preference.summary)
